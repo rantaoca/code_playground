@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#333">
+  <meta name="description" content="Simple PWA timer with notifications">
+  <link rel="manifest" href="data:application/manifest+json,{%22name%22:%22Timer%22,%22short_name%22:%22Timer%22,%22description%22:%22PWA Timer with notifications%22,%22start_url%22:%22/%22,%22display%22:%22standalone%22,%22theme_color%22:%22%23333%22,%22background_color%22:%22%23fff%22,%22icons%22:[{%22src%22:%22data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 192 192%27%3E%3Crect fill=%27%23333%27 width=%27192%27 height=%27192%27/%3E%3Ctext x=%2796%27 y=%27130%27 font-size=%27120%27 text-anchor=%27middle%27 fill=%27%23fff%27%3E⏱%3C/text%3E%3C/svg%3E%22,%22sizes%22:%22192x192%22,%22type%22:%22image/svg+xml%22},{%22src%22:%22data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 512 512%27%3E%3Crect fill=%27%23333%27 width=%27512%27 height=%27512%27/%3E%3Ctext x=%27256%27 y=%27380%27 font-size=%27320%27 text-anchor=%27middle%27 fill=%27%23fff%27%3E⏱%3C/text%3E%3C/svg%3E%22,%22sizes%22:%22512x512%22,%22type%22:%22image/svg+xml%22}]}">
+  <title>Timer</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f5f5f5;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container {
+      background: white;
+      padding: 40px;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      text-align: center;
+      max-width: 400px;
+    }
+    h1 {
+      font-size: 24px;
+      margin-bottom: 30px;
+      color: #333;
+    }
+    #display {
+      font-size: 72px;
+      font-weight: bold;
+      color: #333;
+      margin: 20px 0;
+      font-family: 'Courier New', monospace;
+      letter-spacing: 2px;
+    }
+    .input-group {
+      margin: 20px 0;
+    }
+    input {
+      width: 100%;
+      padding: 12px;
+      font-size: 16px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      margin-bottom: 20px;
+    }
+    .button-group {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 12px 24px;
+      font-size: 16px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+    #start {
+      background: #4CAF50;
+      color: white;
+    }
+    #pause {
+      background: #FF9800;
+      color: white;
+    }
+    #reset {
+      background: #f44336;
+      color: white;
+    }
+    button:active {
+      opacity: 0.8;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>⏱ Timer</h1>
+    <div id="display">0:00</div>
+    <div class="input-group">
+      <input type="number" id="duration" placeholder="Seconds" min="1">
+    </div>
+    <div class="button-group">
+      <button id="start">Start</button>
+      <button id="pause" disabled>Pause</button>
+      <button id="reset">Reset</button>
+    </div>
+  </div>
+
+  <script>
+    const durationInput = document.getElementById('duration');
+    const display = document.getElementById('display');
+    const startBtn = document.getElementById('start');
+    const pauseBtn = document.getElementById('pause');
+    const resetBtn = document.getElementById('reset');
+
+    let timerInterval = null;
+    let remainingMs = 0;
+    let targetTime = 0;
+    let isPaused = false;
+    let swPort = null;
+
+    // Format milliseconds to MM:SS
+    function formatTime(ms) {
+      const totalSeconds = Math.floor(ms / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
+
+    function updateDisplay() {
+      display.textContent = formatTime(remainingMs);
+    }
+
+    function playBeep() {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = 800;
+        gain.gain.setValueAtTime(0.3, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.5);
+      } catch (e) {
+        console.log('Audio not available');
+      }
+    }
+
+    function showNotification() {
+      if ('Notification' in window && Notification.permission === 'granted') {
+        new Notification('Timer Complete', {
+          body: 'Your timer has finished!',
+          icon: 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 192 192%22%3E%3Crect fill=%22%23333%22 width=%22192%22 height=%22192%22/%3E%3Ctext x=%2296%22 y=%22130%22 font-size=%22120%22 text-anchor=%22middle%22 fill=%22%23fff%22%3E⏱%3C/text%3E%3C/svg%3E'
+        });
+      }
+      if ('setAppBadge' in navigator) {
+        navigator.setAppBadge(1);
+      }
+    }
+
+    function clearBadge() {
+      if ('clearAppBadge' in navigator) {
+        navigator.clearAppBadge();
+      }
+    }
+
+    function startTimer() {
+      const seconds = parseInt(durationInput.value);
+      if (!seconds || seconds < 1) return;
+
+      targetTime = Date.now() + (seconds * 1000);
+      remainingMs = seconds * 1000;
+      isPaused = false;
+
+      startBtn.disabled = true;
+      pauseBtn.disabled = false;
+      durationInput.disabled = true;
+
+      // Send to service worker for background timer
+      if (swPort) {
+        swPort.postMessage({ type: 'START_TIMER', targetTime });
+      }
+
+      timerInterval = setInterval(() => {
+        remainingMs = targetTime - Date.now();
+        if (remainingMs <= 0) {
+          clearInterval(timerInterval);
+          remainingMs = 0;
+          updateDisplay();
+          playBeep();
+          showNotification();
+          resetBtn.click();
+        } else {
+          updateDisplay();
+        }
+      }, 100);
+    }
+
+    function pauseTimer() {
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+        isPaused = true;
+        pauseBtn.disabled = true;
+        startBtn.disabled = false;
+      }
+    }
+
+    function resetTimer() {
+      if (timerInterval) clearInterval(timerInterval);
+      timerInterval = null;
+      remainingMs = 0;
+      targetTime = 0;
+      isPaused = false;
+      updateDisplay();
+      startBtn.disabled = false;
+      pauseBtn.disabled = true;
+      durationInput.disabled = false;
+      durationInput.value = '';
+      clearBadge();
+    }
+
+    startBtn.addEventListener('click', startTimer);
+    pauseBtn.addEventListener('click', pauseTimer);
+    resetBtn.addEventListener('click', resetTimer);
+
+    // Request notification permission
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+
+    // Service Worker registration
+    if ('serviceWorker' in navigator) {
+      const swCode = `
+        let activeTimer = null;
+
+        self.addEventListener('message', (e) => {
+          if (e.data.type === 'START_TIMER') {
+            const targetTime = e.data.targetTime;
+
+            if (activeTimer) clearInterval(activeTimer);
+
+            activeTimer = setInterval(() => {
+              if (Date.now() >= targetTime) {
+                self.registration.showNotification('Timer Complete', {
+                  body: 'Your timer has finished!',
+                  icon: 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 192 192%22%3E%3Crect fill=%22%23333%22 width=%22192%22 height=%22192%22/%3E%3Ctext x=%2296%22 y=%22130%22 font-size=%22120%22 text-anchor=%22middle%22 fill=%22%23fff%22%3E⏱%3C/text%3E%3C/svg%3E'
+                });
+                if ('setAppBadge' in self) {
+                  self.setAppBadge(1);
+                }
+                clearInterval(activeTimer);
+                activeTimer = null;
+              }
+            }, 1000);
+          }
+        });
+
+        self.addEventListener('notificationclick', (e) => {
+          e.notification.close();
+          e.waitUntil(clients.matchAll({type: 'window'}).then(clientList => {
+            if (clientList.length > 0) {
+              return clientList[0].focus();
+            }
+            return clients.openWindow('/');
+          }));
+        });
+      `;
+
+      const blob = new Blob([swCode], { type: 'application/javascript' });
+      const swUrl = URL.createObjectURL(blob);
+
+      navigator.serviceWorker.register(swUrl).then(reg => {
+        const worker = reg.active || reg.installing || reg.waiting;
+        if (worker) {
+          swPort = worker;
+        }
+        reg.onupdatefound = () => {
+          const newWorker = reg.installing;
+          newWorker.onactivate = () => {
+            swPort = newWorker;
+          };
+        };
+      }).catch(e => console.log('SW registration failed:', e));
+    }
+  </script>
+</body>
+</html>
