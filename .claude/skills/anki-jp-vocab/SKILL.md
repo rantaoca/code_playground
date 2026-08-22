@@ -15,6 +15,30 @@ human, in the browser at http://localhost:8877) as a concurrent editor of
 that file — always re-read it immediately before you write to it, never
 assume your in-memory copy is still current.
 
+## Environment gotchas — read before running any command
+
+These have all bitten previous runs. They cost real time to re-diagnose, so
+just follow them:
+
+- **Always invoke the venv interpreter explicitly**: `anki-jp-vocab/.venv/bin/python3`.
+  Bare `python3` is the system/Homebrew Python and has neither `pyyaml` nor
+  `requests` — you'll get `ModuleNotFoundError: No module named 'yaml'`. This
+  applies to your own ad-hoc YAML-editing scripts too, not just `app.py`.
+- **The Bash tool's shell does not read `~/.zshrc`**, so `PIXABAY_API_KEY` /
+  `ELEVENLABS_API_KEY` are absent even when they're correctly set in the
+  user's profile. Any command that touches those APIs must be prefixed with
+  `source ~/.zshrc &&`. Symptom without it: `PIXABAY_API_KEY is not set`
+  from `images-search --source pixabay`, even though Step 0's grep found it.
+- **Never paste a real API key inline on a command line** as a workaround for
+  the above. It leaks the secret into the transcript and will be blocked as
+  credential leakage. `source ~/.zshrc` is the only correct fix.
+- **Check for an already-running server before starting one** (see Step 3).
+  A stale server from a previous session silently owns port 8877 and serves
+  its own state, which looks exactly like "my edits to `state.yaml` aren't
+  taking effect."
+- **There is no `/api/state` endpoint.** Don't probe invented URLs to inspect
+  state — read `/tmp/anki_jp_vocab/state.yaml` directly.
+
 ## One-time setup (skip if already done)
 
 ```bash
@@ -156,7 +180,14 @@ For each card, before starting the review server:
    `meaning`**, not the Japanese expression. Pixabay's index is tagged in
    English and Japanese-text queries mostly return zero results there
    (unlike irasutoya, which is Japanese-tagged and wants the Japanese word).
-   Requires `PIXABAY_API_KEY` — if it isn't set, just leave the card
+   The pixabay source needs `PIXABAY_API_KEY` in the environment, which the
+   Bash tool does not inherit — prefix the command with `source ~/.zshrc &&`:
+
+   ```bash
+   source ~/.zshrc && anki-jp-vocab/.venv/bin/python3 anki-jp-vocab/app.py images-search --query "<english meaning>" --source pixabay --limit 5
+   ```
+
+   If the key genuinely isn't set in the profile either, just leave the card
    imageless and let the human pick one in the review UI instead of
    blocking.
 
@@ -165,14 +196,75 @@ without an image; the human can search/swap images themselves in the UI.
 
 ## Step 3 — start the review server
 
-Run `anki-jp-vocab/.venv/bin/python3 anki-jp-vocab/app.py` in the background (it opens the browser
-itself at http://localhost:8877). Tell the user it's open and to approve
+**First, check whether a server is already running** — a stale one from an
+earlier session will hold port 8877 and keep serving its own copy of the
+state, so every restart you attempt silently fails to bind and the UI never
+reflects your edits:
+
+```bash
+ps aux | grep "[a]pp.py"
+```
+
+If that turns up a process, kill it by **PID** and confirm it's gone. Do not
+rely on a `pkill -f` pattern — the running process's command line is the
+absolute venv interpreter path plus `app.py serve --no-browser`, so patterns
+like `pkill -f "python3 app.py"` match nothing and leave it alive:
+
+```bash
+kill <pid>; sleep 1; ps aux | grep "[a]pp.py" || echo "all stopped"
+```
+
+Then start the server in the background, sourcing the shell profile so the
+ElevenLabs key is present in its environment (without this, audio generation
+in the UI fails):
+
+```bash
+cd anki-jp-vocab && source ~/.zshrc && nohup .venv/bin/python3 app.py serve --no-browser > /tmp/anki_review.log 2>&1 &
+```
+
+Confirm it's actually up before telling the user — a bind failure is
+otherwise invisible:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8877
+```
+
+Expect `200`. Then open http://localhost:8877 for the user. Tell them it's open and to approve
 cards, edit fields inline, mark cards "needs edit" with a note on what they
 want changed, swap/remove images, and/or generate/regenerate/remove word +
 example-sentence audio (ElevenLabs, picks up whichever voice is selected in
 the header dropdown). A "Generate all audio" button with a progress bar
 fills in whatever's still missing across every card using the selected
-voice. Then come back to chat.
+voice. There's also a "Push approved to Anki" button in the header — pushing to
+Anki is theirs to do, not yours; never run `app.py push`. Then come back to chat.
+
+## Step 3.5 — report problems from this run and offer to bank them
+
+Right after you hand the review UI back to the user (and before you settle
+into the Step 4 edit loop), take stock of the run so far and post a short
+list in chat of every problem you hit getting here — failed commands,
+wrong assumptions, denied permissions, dead ends, anything you had to
+diagnose and work around. Include the ones you recovered from silently;
+those are exactly the ones that cost the next agent time.
+
+For each, state the symptom and the actual cause in one line, e.g.
+"`ModuleNotFoundError: No module named 'yaml'` — used system `python3`
+instead of the venv interpreter."
+
+If the run was genuinely clean, say so in one line and move on — don't
+manufacture findings.
+
+Then ask the user whether they want these written into this skill file
+(`.claude/skills/anki-jp-vocab/SKILL.md`) so future runs avoid them. Wait
+for their answer; do not edit the skill unprompted. If they say yes:
+
+- Fold each confirmed item into the most relevant existing section —
+  **Environment gotchas** for setup/env/tooling traps, or the specific
+  numbered step whose instructions were wrong or incomplete.
+- Prefer correcting the instruction that misled you over appending another
+  warning. If a documented command doesn't work, fix the command.
+- Keep it short. This file is read in full on every run; a growing pile of
+  war stories makes it worse, not better.
 
 ## Step 4 — the chat/edit loop
 
@@ -194,21 +286,6 @@ Repeat until no cards are left `pending` or `needs_edit`:
 Don't re-litigate cards the human already approved without them raising it
 again — approved means done.
 
-## Step 5 — push to Anki
-
-Once nothing is left pending, confirm Anki (the desktop app) is open, then
-run:
-
-```bash
-anki-jp-vocab/.venv/bin/python3 anki-jp-vocab/app.py push
-```
-
-This creates the `Japanese Vocab AI Gen` note type and the
-`1 Japanese::Japanese Vocab AI Gen` deck in Anki if they don't already
-exist (separate from the older `Japanese Personal Vocab` note type/deck,
-which this pipeline no longer writes to), adds every `approved` card as a
-note (with its image and any generated audio attached — cards with no
-generated audio fall back to Anki's built-in system TTS automatically), and
-flips each to `status: pushed`. Report the pushed count and any per-card
-errors it returns (e.g. AnkiConnect unreachable means Anki isn't open —
-ask the user to open it and retry, don't work around it another way).
+If anything went wrong *after* the Step 3.5 retrospective — during the edit
+loop, or with the push once they report back — raise those the same way
+Step 3.5 describes: list them, and ask whether to fold them into this skill.
