@@ -32,3 +32,12 @@ How it works:
 1. Claude drafts the cards
 2. You review/edit/approve them in a browser UI (`localhost:8877`)
 3. Approved cards get pushed straight into Anki via AnkiConnect
+
+
+## Human Workflow
+
+For Shirabe iOS App:
+1. Star new words to the latest anki list
+2. When ready, export list as txt, copy to keep to send to computer
+3. Rename old list with date of export, then create a new anki list
+4. On computer, run this skill for that list
