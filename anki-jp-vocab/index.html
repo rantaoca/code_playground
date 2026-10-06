@@ -239,12 +239,14 @@ function renderSentenceAudioRow(card) {
 
 function renderAudioRow(card, kind, label) {
   const path = card[`audio_${kind}_path`];
-  const url = path ? `/audio/${path.split('/').pop()}` : null;
+  // Server-stamped with the file's mtime, so regenerated clips get a fresh
+  // URL without re-downloading every clip on each render.
+  const url = card[`audio_${kind}_url`] || (path ? `/audio/${path.split('/').pop()}` : null);
   const attribution = card[`audio_${kind}_source`] === 'elevenlabs' ? `ElevenLabs — ${card[`audio_${kind}_attribution`] || ''}` : '';
   return `
     <div class="audio-row" data-kind="${kind}">
       <label>${label}</label>
-      ${url ? `<audio controls src="${url}?t=${Date.now()}"></audio>` : `<span class="noaudio">no audio</span>`}
+      ${url ? `<audio controls src="${url}"></audio>` : `<span class="noaudio">no audio</span>`}
       ${attribution ? `<span class="attribution">${escapeHtml(attribution)}</span>` : ''}
       <button data-act="gen_audio" data-kind="${kind}">${url ? 'Regenerate' : 'Generate'}</button>
       ${url ? `<button data-act="remove_audio" data-kind="${kind}" class="danger">Remove</button>` : ''}
@@ -275,7 +277,10 @@ function renderCard(card) {
   const el = document.createElement('div');
   el.className = 'card';
   el.dataset.id = card.id;
-  const imgUrl = card.image_path ? `/images/${card.image_path.split('/').pop()}` : null;
+  // Prefer the server's mtime-stamped URL: a re-upload reuses the card's
+  // filename, so a bare /images/<id>.png would be served from cache and the
+  // card would keep showing the old picture.
+  const imgUrl = card.image_url || (card.image_path ? `/images/${card.image_path.split('/').pop()}` : null);
 
   el.innerHTML = `
     <div class="row">
@@ -311,10 +316,17 @@ function renderCard(card) {
           <div class="tabs">
             <button data-src="irasutoya">Irasutoya</button>
             <button data-src="pixabay">Pixabay</button>
+            <button data-act="upload_tab">Upload</button>
           </div>
-          <input type="text" class="searchq" value="${escapeAttr(stripFurigana(card.expression))}">
-          <button data-act="search_img">Search</button>
-          <div class="candidates"></div>
+          <div class="search-section">
+            <input type="text" class="searchq" value="${escapeAttr(stripFurigana(card.expression))}">
+            <button data-act="search_img">Search</button>
+            <div class="candidates"></div>
+          </div>
+          <div class="upload-section" style="display:none">
+            <input type="file" class="file-input" accept="image/*">
+            <button data-act="upload_img">Upload</button>
+          </div>
         </div>
       </div>
     </div>
@@ -335,6 +347,9 @@ function renderCard(card) {
   const panel = el.querySelector('.imgpanel');
   let activeSource = 'irasutoya';
   const searchqInput = el.querySelector('.searchq');
+  const searchSection = el.querySelector('.search-section');
+  const uploadSection = el.querySelector('.upload-section');
+
   el.querySelectorAll('[data-src]').forEach(btn => {
     btn.addEventListener('click', () => {
       activeSource = btn.dataset.src;
@@ -342,8 +357,37 @@ function renderCard(card) {
       // Japanese-text queries; irasutoya is Japanese-tagged and wants the
       // Japanese word. Default the search box to whichever fits the source.
       searchqInput.value = activeSource === 'pixabay' ? (card.meaning || '') : stripFurigana(card.expression);
+      searchSection.style.display = 'block';
+      uploadSection.style.display = 'none';
     });
   });
+
+  el.querySelector('[data-act=upload_tab]').addEventListener('click', () => {
+    uploadSection.style.display = 'block';
+    searchSection.style.display = 'none';
+  });
+
+  el.querySelector('[data-act=upload_img]').addEventListener('click', async () => {
+    const fileInput = el.querySelector('.file-input');
+    if (!fileInput.files.length) { alert('Select a file first'); return; }
+    const file = fileInput.files[0];
+    const fd = new FormData();
+    fd.append('file', file);
+    // Let the browser set Content-Type so it carries the multipart boundary.
+    try {
+      const res = await fetch(`/api/cards/${card.id}/image/upload`, { method: 'POST', body: fd });
+      const data = await res.json();
+      if (data.error) { alert('Error: ' + data.error); return; }
+      fileInput.value = '';
+      panel.classList.remove('open');
+      loadCards();
+    } catch (e) {
+      // Without this the promise rejects silently and the button just
+      // appears to do nothing.
+      alert('Upload failed: ' + e);
+    }
+  });
+
   el.querySelector('[data-act=change_image]').addEventListener('click', () => panel.classList.toggle('open'));
   el.querySelector('[data-act=search_img]').addEventListener('click', async () => {
     const q = el.querySelector('.searchq').value;
@@ -401,6 +445,7 @@ async function generateAudio(card, kind) {
   const data = await res.json();
   if (data.error) { alert('Error: ' + data.error); return; }
   card[`audio_${kind}_path`] = data.audio_url;
+  card[`audio_${kind}_url`] = data.audio_url;
   card[`audio_${kind}_source`] = 'elevenlabs';
   card[`audio_${kind}_attribution`] = v.voice_name;
   refreshAudioRow(card, kind);
@@ -415,6 +460,7 @@ async function removeAudio(card, kind) {
   const data = await res.json();
   if (data.error) { alert('Error: ' + data.error); return; }
   card[`audio_${kind}_path`] = null;
+  card[`audio_${kind}_url`] = null;
   card[`audio_${kind}_source`] = null;
   card[`audio_${kind}_attribution`] = null;
   refreshAudioRow(card, kind);
@@ -466,6 +512,7 @@ async function generateAllAudio() {
         const card = state.cards.find(c => String(c.id) === String(t.id));
         if (card) {
           card[`audio_${t.kind}_path`] = data.audio_url;
+          card[`audio_${t.kind}_url`] = data.audio_url;
           card[`audio_${t.kind}_source`] = 'elevenlabs';
           card[`audio_${t.kind}_attribution`] = v.voice_name;
           refreshAudioRow(card, t.kind);

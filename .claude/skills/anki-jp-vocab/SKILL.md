@@ -4,13 +4,20 @@ description: Turn a pasted list of unstructured Japanese vocab into reviewed Ank
 argument-hint: "(optional) paste the vocab list directly, or leave blank and I'll ask for it"
 ---
 
+## ⚠️ CRITICAL: Work directory constraint
+
+**This skill ONLY runs in `/Users/rantaoca/Documents/code_playground/`, never in `code_playground_local` or any other location.** The venv, state.yaml, images, audio, and all pipeline paths are hardcoded to this specific directory. If you find yourself in a different directory, stop and clarify with the user before proceeding.
+
+---
+
 You are orchestrating the pipeline in `anki-jp-vocab/` (a sibling directory
 at the repo root: `app.py`, `index.html` — that's the whole thing, `app.py`
 holds all the backend logic: state, image search, ElevenLabs TTS,
 AnkiConnect push, and the review HTTP server, plus a CLI you invoke
 directly for the generation steps below).
 
-All state lives in `/tmp/anki_jp_vocab/state.yaml`. Treat the review UI (a
+All state lives in `anki-jp-vocab/state.yaml`, alongside `app.py` (with
+`images/` and `audio/` as sibling directories). Treat the review UI (a
 human, in the browser at http://localhost:8877) as a concurrent editor of
 that file — always re-read it immediately before you write to it, never
 assume your in-memory copy is still current.
@@ -20,6 +27,9 @@ assume your in-memory copy is still current.
 These have all bitten previous runs. They cost real time to re-diagnose, so
 just follow them:
 
+- **Verify you are in `/Users/rantaoca/Documents/code_playground/`** before running anything.
+  If your working directory is different (e.g. `code_playground_local`), stop and ask the user
+  to clarify. All paths and the venv are hardcoded to this location.
 - **Always invoke the venv interpreter explicitly**: `anki-jp-vocab/.venv/bin/python3`.
   Bare `python3` is the system/Homebrew Python and has neither `pyyaml` nor
   `requests` — you'll get `ModuleNotFoundError: No module named 'yaml'`. This
@@ -37,7 +47,7 @@ just follow them:
   its own state, which looks exactly like "my edits to `state.yaml` aren't
   taking effect."
 - **There is no `/api/state` endpoint.** Don't probe invented URLs to inspect
-  state — read `/tmp/anki_jp_vocab/state.yaml` directly.
+  state — read `anki-jp-vocab/state.yaml` directly.
 
 ## One-time setup (skip if already done)
 
@@ -128,6 +138,18 @@ For each distinct vocab item, produce:
   - `砂漠[さばく]`
   - `追[お]い 払[はら]う`
   - `訳[わけ]ではない`
+
+  **Always put a half-width space immediately before each bracketed kanji
+  run** unless it starts the field. Anki applies the reading to everything
+  back to the previous space, so without one, preceding kana or punctuation
+  gets swallowed under the furigana. This includes runs after kana
+  (`朝[あさ]ご 飯[はん]`, `使[つか]い 方[かた]`) and after punctuation like
+  brackets or commas (`「 静[しず]か」`, `、 試合[しあい]`). Applies to
+  `expression` and `example_jpn` alike. (If the reading deliberately
+  covers digits/kana too, e.g. `60年代[ろくじゅうねんだい]`, the space goes
+  before that whole span instead.) When checking for violations with a
+  regex, the lookbehind must exclude kanji as well as whitespace —
+  `(?<=[^\s一-龯々〆ヶ])` — or it splits inside kanji runs.
 - **meaning** — concise English gloss (a few words, not a full definition).
 - **example_jpn** — one short original sentence using the word, written in
   the same `kanji[reading]` furigana style. Keep it short (one clause where
@@ -135,7 +157,7 @@ For each distinct vocab item, produce:
   N1/N2 constructions, no rare kanji outside the target word itself.
 - **example_en** — natural English translation of that sentence.
 
-Write these into `/tmp/anki_jp_vocab/state.yaml` as:
+Write these into `anki-jp-vocab/state.yaml` as:
 
 ```yaml
 cards:
@@ -159,7 +181,15 @@ cards:
     ...
 ```
 
-`id` is a simple incrementing integer, unique within this batch. The
+If `state.yaml` already holds an earlier batch, **append** — don't replace
+it. Previous cards may still be `pending`/`needs_edit` (unpushed), and
+`images/<id>.*` / `audio/<id>_*.mp3` are keyed by id, so restarting at 1
+would overwrite their files. Start new ids at `max(existing id) + 1`; if a
+new item duplicates an unpushed old card, rewrite that card in place
+(clearing its stale audio fields). Pushed cards are hidden in the UI by
+default, so leaving them is harmless.
+
+`id` is a simple incrementing integer, unique across the file. The
 `audio_*` fields are populated later by the human in the review UI
 (Step 3), not by you — leave them null when generating cards.
 
@@ -167,14 +197,29 @@ cards:
 
 For each card, before starting the review server:
 
-1. Run `anki-jp-vocab/.venv/bin/python3 anki-jp-vocab/app.py images-search --query "<expression stripped of furigana brackets>" --source irasutoya --limit 5`.
+1. Run `anki-jp-vocab/.venv/bin/python3 anki-jp-vocab/app.py images-search --query "<keyword>" --source irasutoya --limit 5`.
+   - `<keyword>` is the expression stripped of furigana brackets **only if
+     it's a single noun/word**. Irasutoya returns zero hits for phrases
+     (コードを書く, 風邪を引く, 口の中がぱさぱさ) — search the core concrete
+     noun instead (プログラマー, 風邪, パン) or something the example
+     sentence depicts (りんご for ～個, カレンダー for 一か月).
+   - Irasutoya rate-limits: back-to-back searches intermittently return
+     `{"error": "503 Server Error: Service Unavailable"}`. Loop over cards in
+     one script with `time.sleep(1.5)` between calls, and retry any 503s.
 2. Judge the top couple of results by title text for topical relevance to
-   the word/meaning. If genuinely unsure, you may fetch a candidate's
+   the word/meaning. Skip junk hits whose `image_url` isn't an image (e.g.
+   プライバシーポリシー / 免責事項 with a `<!--Can't find substitution...-->`
+   URL — returned for grammar-ish queries like について or 場合), and strip a
+   stray trailing `.` from URLs ending `.jpg.`. If genuinely unsure, you may fetch a candidate's
    `thumb_url` with curl into a scratch file and view it with Read — irasutoya
    images are simple flat illustrations, cheap to eyeball.
 3. If there's a decent match, download it:
-   `anki-jp-vocab/.venv/bin/python3 anki-jp-vocab/app.py images-download --url <image_url> --dest /tmp/anki_jp_vocab/images/<id>.jpg`
+   `anki-jp-vocab/.venv/bin/python3 anki-jp-vocab/app.py images-download --url <image_url> --dest "$(pwd)/anki-jp-vocab/images/<id>.jpg"`
    and set that card's `image_path` / `image_source: irasutoya` in the YAML.
+   `image_path` must be an **absolute** path — that's what the review UI
+   writes when the human swaps an image, and what `push` feeds to
+   AnkiConnect. A relative path resolves against the server's own working
+   directory and silently drops the image from the pushed note.
 4. If nothing relevant turns up (or the site returns zero results), fall
    back to `--source pixabay` — but search using the card's **English
    `meaning`**, not the Japanese expression. Pixabay's index is tagged in
@@ -191,8 +236,9 @@ For each card, before starting the review server:
    imageless and let the human pick one in the review UI instead of
    blocking.
 
-This is a best-effort first pass, not a gate — cards can go into review
-without an image; the human can search/swap images themselves in the UI.
+This is a best-effort first pass, not a gate — abstract words and grammar
+terms (動詞, 主語, さらに…) rarely have a good image; leave them imageless
+rather than forcing a weak match. Cards can go into review without an image; the human can search/swap images themselves in the UI.
 
 ## Step 3 — start the review server
 
@@ -270,7 +316,7 @@ for their answer; do not edit the skill unprompted. If they say yes:
 
 Repeat until no cards are left `pending` or `needs_edit`:
 
-1. Re-read `/tmp/anki_jp_vocab/state.yaml`.
+1. Re-read `anki-jp-vocab/state.yaml`.
 2. For every card with `status: needs_edit`, discuss it with the user in
    chat — read their `notes` field as the starting point, ask follow-ups if
    the request is ambiguous. Don't silently guess at a rewrite of a

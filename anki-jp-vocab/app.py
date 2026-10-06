@@ -16,7 +16,7 @@ Run modes:
     python3 app.py audio-speak --text 本業 --voice-id <id> --dest /tmp/out.mp3
 
 State lives in a flat YAML file so a human or an AI can both read/edit it
-directly between steps: /tmp/anki_jp_vocab/state.yaml
+directly between steps: anki-jp-vocab/state.yaml
 """
 import argparse
 import html
@@ -33,11 +33,12 @@ import requests
 import yaml
 
 PORT = 8877
-STATE_DIR = "/tmp/anki_jp_vocab"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = SCRIPT_DIR
 STATE_FILE = os.path.join(STATE_DIR, "state.yaml")
 IMAGES_DIR = os.path.join(STATE_DIR, "images")
 AUDIO_DIR = os.path.join(STATE_DIR, "audio")
-STATIC_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = SCRIPT_DIR
 
 ANKICONNECT_URL = "http://127.0.0.1:8765"
 # Separate note type + deck from the original "Japanese Personal Vocab" /
@@ -98,6 +99,61 @@ def find_card(state, card_id):
         if str(c["id"]) == str(card_id):
             return c
     return None
+
+
+ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+_IMAGE_MAGIC = [
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+    (b"BM", ".bmp"),
+]
+
+
+def media_url(route: str, path: str) -> str | None:
+    """Build a /images/... or /audio/... URL stamped with the file's mtime.
+
+    Re-uploading a picture (or regenerating audio) overwrites the file under
+    the card's existing name, so the URL alone never changes and the browser
+    happily keeps showing the copy it already has in memory. The mtime stamp
+    makes each new version a distinct URL.
+    """
+    if not path:
+        return None
+    abs_path = path if os.path.isabs(path) else os.path.join(STATE_DIR, path)
+    url = f"/{route}/{os.path.basename(abs_path)}"
+    try:
+        return f"{url}?v={int(os.path.getmtime(abs_path))}"
+    except OSError:
+        return url
+
+
+def with_media_urls(state: dict) -> dict:
+    """Card list for the UI, each card carrying versioned media URLs.
+
+    Computed per request rather than stored, so state.yaml stays the plain
+    hand-editable file the pipeline expects.
+    """
+    cards = []
+    for card in state.get("cards", []):
+        card = dict(card)
+        card["image_url"] = media_url("images", card.get("image_path"))
+        card["audio_word_url"] = media_url("audio", card.get("audio_word_path"))
+        card["audio_sentence_url"] = media_url("audio", card.get("audio_sentence_path"))
+        cards.append(card)
+    return {**state, "cards": cards}
+
+
+def _sniff_image_ext(data: bytes) -> str:
+    """Fall back to magic bytes when the upload has no usable filename."""
+    for magic, ext in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return ext
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ""
 
 
 _FURIGANA_RE = re.compile(r"\[[^\]]*\]")
@@ -379,9 +435,65 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             return {}
-        return json.loads(self.rfile.read(length))
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            # Never let a malformed/binary body escape as an exception: an
+            # unhandled error here kills the connection with no response at
+            # all, which the browser only sees as "Failed to fetch".
+            return {}
 
-    def _serve_file(self, path, content_type):
+    def _parse_multipart_file(self, field_name="file"):
+        """Pull one file field out of a multipart/form-data body.
+
+        Returns (filename, data), or (None, None) if the field is absent.
+        Hand-rolled on purpose: the stdlib `cgi` module is gone as of Python
+        3.13, and this only ever needs a single small file field.
+        """
+        ctype = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in ctype:
+            raise ValueError("multipart/form-data required")
+
+        m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', ctype)
+        if not m:
+            raise ValueError("multipart body has no boundary")
+        boundary = (m.group(1) or m.group(2)).strip().encode()
+
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            raise ValueError("empty request body")
+        body = self.rfile.read(length)
+
+        # A multipart body is: --BOUNDARY CRLF headers CRLF CRLF data CRLF
+        # repeated, terminated by --BOUNDARY--. The client guarantees the
+        # boundary never occurs inside the payload, so a plain split is safe.
+        for segment in body.split(b"--" + boundary)[1:-1]:
+            segment = segment[2:] if segment.startswith(b"\r\n") else segment
+            split_at = segment.find(b"\r\n\r\n")
+            if split_at == -1:
+                continue
+            raw_headers = segment[:split_at].decode("utf-8", "replace")
+            data = segment[split_at + 4:]
+            if data.endswith(b"\r\n"):
+                data = data[:-2]
+
+            disposition = ""
+            for line in raw_headers.split("\r\n"):
+                if line.lower().startswith("content-disposition:"):
+                    disposition = line
+                    break
+            name_m = re.search(r'name=(?:"([^"]*)"|([^;]+))', disposition)
+            name = (name_m.group(1) or name_m.group(2)).strip() if name_m else ""
+            if name != field_name:
+                continue
+            fn_m = re.search(r'filename=(?:"([^"]*)"|([^;]+))', disposition)
+            filename = (fn_m.group(1) or fn_m.group(2)).strip() if fn_m else ""
+            return filename, data
+
+        return None, None
+
+    def _serve_file(self, path, content_type, no_cache=False):
         if not os.path.exists(path):
             self._json({"error": "not found"}, 404)
             return
@@ -390,19 +502,83 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if no_cache:
+            # Media is overwritten in place (a re-upload reuses the card's
+            # filename), so a cached copy would keep showing the old picture
+            # even after the new one lands on disk.
+            self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
+
+    def _handle_image_upload(self, card_id):
+        # Parse before anything else can bail out: leaving an unread body in
+        # the socket desyncs the next request on a keep-alive connection.
+        try:
+            filename, data = self._parse_multipart_file("file")
+        except ValueError as e:
+            self._json({"error": str(e)}, 400)
+            return
+        except Exception as e:
+            self._json({"error": f"could not parse upload: {e}"}, 400)
+            return
+
+        if not data:
+            self._json({"error": "no file uploaded"}, 400)
+            return
+
+        state = load_state()
+        card = find_card(state, card_id)
+        if not card:
+            self._json({"error": "no such card"}, 404)
+            return
+
+        # Honour the real extension: saving a PNG as .jpg makes the browser
+        # (and Anki) guess the wrong type, and it silently reuses the old
+        # URL so the card keeps showing the previous picture.
+        ext = os.path.splitext(filename or "")[1].lower()
+        if ext not in ALLOWED_IMAGE_EXTS:
+            ext = _sniff_image_ext(data)
+        if not ext:
+            self._json({"error": f"unsupported image type: {filename!r}"}, 400)
+            return
+
+        os.makedirs(IMAGES_DIR, exist_ok=True)
+        dest = os.path.join(IMAGES_DIR, f"{card['id']}{ext}")
+        with open(dest, "wb") as f:
+            f.write(data)
+
+        # Drop the previous file when the new one lands under a different
+        # extension, otherwise it lingers in images/ forever.
+        old = card.get("image_path")
+        if old:
+            old_abs = old if os.path.isabs(old) else os.path.join(STATE_DIR, old)
+            if os.path.abspath(old_abs) != os.path.abspath(dest) and os.path.exists(old_abs):
+                try:
+                    os.remove(old_abs)
+                except OSError:
+                    pass
+
+        card["image_path"] = dest
+        card["image_source"] = "uploaded"
+        save_state(state)
+        self._json({"image_url": media_url("images", dest)})
 
     def do_GET(self):
         parsed = urlparse(self.path)
         path, qs = parsed.path, parse_qs(parsed.query)
 
         if path == "/":
-            self._serve_file(os.path.join(STATIC_DIR, "index.html"), "text/html; charset=utf-8")
+            # Served uncached so edits to the UI show up on a plain reload
+            # rather than needing a hard refresh.
+            self._serve_file(
+                os.path.join(STATIC_DIR, "index.html"),
+                "text/html; charset=utf-8",
+                no_cache=True,
+            )
             return
 
         if path == "/api/cards":
-            self._json(load_state())
+            self._json(with_media_urls(load_state()))
             return
 
         m = re.match(r"^/api/cards/([^/]+)/candidates$", path)
@@ -421,14 +597,14 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             filename = m.group(1)
             ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-            self._serve_file(os.path.join(IMAGES_DIR, filename), ctype)
+            self._serve_file(os.path.join(IMAGES_DIR, filename), ctype, no_cache=True)
             return
 
         m = re.match(r"^/audio/(.+)$", path)
         if m:
             filename = m.group(1)
             ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-            self._serve_file(os.path.join(AUDIO_DIR, filename), ctype)
+            self._serve_file(os.path.join(AUDIO_DIR, filename), ctype, no_cache=True)
             return
 
         if path == "/api/voices":
@@ -443,6 +619,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
+
+        # The image upload is the one route with a binary (multipart) body, so
+        # it has to be dispatched before the JSON read below — that read would
+        # otherwise swallow the bytes and choke on them.
+        m = re.match(r"^/api/cards/([^/]+)/image/upload$", path)
+        if m:
+            self._handle_image_upload(m.group(1))
+            return
+
         body = self._read_json_body()
 
         m = re.match(r"^/api/cards/([^/]+)$", path)
@@ -479,7 +664,7 @@ class Handler(BaseHTTPRequestHandler):
             card["image_path"] = dest
             card["image_source"] = body.get("source", "")
             save_state(state)
-            self._json({"image_url": f"/images/{os.path.basename(dest)}"})
+            self._json({"image_url": media_url("images", dest)})
             return
 
         m = re.match(r"^/api/cards/([^/]+)/image/remove$", path)
@@ -525,7 +710,7 @@ class Handler(BaseHTTPRequestHandler):
             card[f"audio_{kind}_source"] = "elevenlabs"
             card[f"audio_{kind}_attribution"] = voice_name
             save_state(state)
-            self._json({"audio_url": f"/audio/{os.path.basename(dest)}"})
+            self._json({"audio_url": media_url("audio", dest)})
             return
 
         m = re.match(r"^/api/cards/([^/]+)/audio/remove$", path)
