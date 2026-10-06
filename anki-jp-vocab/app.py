@@ -163,6 +163,14 @@ def strip_furigana(text):
     return _FURIGANA_RE.sub("", text or "")
 
 
+def tts_text(text):
+    """Field text as sent to the voice model: no furigana, no spaces.
+
+    The spaces exist only to anchor Anki furigana; TTS reads them as pauses.
+    """
+    return re.sub(r"\s+", "", strip_furigana(text))
+
+
 # ---------- image search (irasutoya scrape + Pixabay API) ----------
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -696,7 +704,7 @@ class Handler(BaseHTTPRequestHandler):
             voice_id = body.get("voice_id")
             voice_name = body.get("voice_name", "")
             source_field = "expression" if kind == "word" else "example_jpn"
-            text = strip_furigana(card.get(source_field, ""))
+            text = tts_text(card.get(source_field, ""))
             if not text:
                 self._json({"error": f"card has no {source_field} text to speak"}, 400)
                 return

@@ -260,6 +260,12 @@ like `pkill -f "python3 app.py"` match nothing and leave it alive:
 kill <pid>; sleep 1; ps aux | grep "[a]pp.py" || echo "all stopped"
 ```
 
+Read the PID off the `ps` output and type it in literally, as its own
+command. Don't scripted-kill everything `grep "[a]pp.py"` matches (e.g.
+`for p in $(ps aux | grep ...)`) — the Bash tool's own shell has `app.py`
+in its command line, so the loop kills itself and nothing after it (like
+the server restart) runs.
+
 Then start the server in the background, sourcing the shell profile so the
 ElevenLabs key is present in its environment (without this, audio generation
 in the UI fails):
@@ -281,7 +287,11 @@ want changed, swap/remove images, and/or generate/regenerate/remove word +
 example-sentence audio (ElevenLabs, picks up whichever voice is selected in
 the header dropdown). A "Generate all audio" button with a progress bar
 fills in whatever's still missing across every card using the selected
-voice. There's also a "Push approved to Anki" button in the header — pushing to
+voice. Text sent to the voice model must have furigana brackets **and all
+spaces** stripped (the spaces only anchor Anki furigana; TTS reads them as
+pauses) — the UI does this via `tts_text()` in `app.py`; if you ever call
+`app.py audio-speak --text ...` yourself, pass already-stripped text.
+There's also a "Push approved to Anki" button in the header — pushing to
 Anki is theirs to do, not yours; never run `app.py push`. Then come back to chat.
 
 ## Step 3.5 — report problems from this run and offer to bank them
